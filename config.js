@@ -2,14 +2,14 @@ require('dotenv').config();
 
 module.exports = {
   PORT: process.env.PORT || 3000,
-  API_KEY: process.env.API_KEY || 'your-secret-api-key-change-this',
+  API_KEY: process.env.API_KEY || 'Aptap786920',
 
   DB: {
     host: process.env.DB_HOST || 'localhost',
     port: process.env.DB_PORT || 3306,
     user: process.env.DB_USER || 'root',
     password: process.env.DB_PASSWORD || '',
-    database: process.env.DB_NAME || 'otp_gateway',
+    database: process.env.DB_NAME || 'cztldhwx_whatsapp-otp-gateway',
     waitForConnections: true,
     connectionLimit: 10,
     queueLimit: 0,
