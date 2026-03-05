@@ -1,146 +1,209 @@
+// whatsapp.js - Multi-session WhatsApp manager
 const { Client, LocalAuth } = require('whatsapp-web.js');
-const qrcode = require('qrcode-terminal');
-const config = require('./config');
+const qrcode  = require('qrcode');
+const path    = require('path');
+const fs      = require('fs');
+const config  = require('./config');
 const { saveOTP } = require('./database');
 
-// In-memory session registry
-const sessions = {};
-// QR codes waiting to be scanned
-const pendingQRs = {};
+// ── OTP regex — matches 4-8 consecutive digits ─────────────────────────────────
+const OTP_REGEX = /\b(\d{4,8})\b/g;
 
 function extractOTP(text) {
-  const matches = text.match(config.OTP_REGEX);
-  if (!matches) return null;
-  // Return the first match that looks like a real OTP (4-8 digits)
-  for (const m of matches) {
-    if (m.length >= 4 && m.length <= 8) return m;
-  }
-  return null;
+  const matches = text.match(OTP_REGEX);
+  return matches ? matches[0] : null;
 }
 
+// ── In-memory session store ────────────────────────────────────────────────────
+// Map<sessionName, { client, status, qrCode, qrDataURL, phone }>
+const sessions = new Map();
+
+// ── Ensure session directory exists ───────────────────────────────────────────
+function ensureSessionDir() {
+  const dir = path.resolve(config.SESSION_DIR);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+// ── Create or restore one WhatsApp session ─────────────────────────────────────
 function createSession(sessionName) {
-  if (sessions[sessionName]) {
-    return { success: false, error: 'Session already exists' };
+  if (sessions.has(sessionName)) {
+    const existing = sessions.get(sessionName);
+    if (['connected', 'initializing', 'qr_pending'].includes(existing.status)) {
+      console.log(`[WA] Session "${sessionName}" already active (${existing.status})`);
+      return existing;
+    }
+    // Clean up dead session before recreating
+    try { existing.client.destroy(); } catch (_) {}
   }
 
-  console.log(`[WA] Creating session: ${sessionName}`);
+  console.log(`[WA] Starting session: ${sessionName}`);
+
+  const sessionData = {
+    client:    null,
+    status:    'initializing',
+    qrCode:    null,
+    qrDataURL: null,
+    phone:     null,
+    name:      sessionName,
+  };
+  sessions.set(sessionName, sessionData);
 
   const client = new Client({
     authStrategy: new LocalAuth({
-      clientId: sessionName,
-      dataPath: config.WHATSAPP.sessionDir,
+      clientId:   sessionName,
+      dataPath:   path.resolve(config.SESSION_DIR),
     }),
     puppeteer: {
       headless: true,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
-        '--no-first-run',
-        '--no-zygote',
-        '--single-process',
-        '--disable-gpu',
-      ],
+      args: config.PUPPETEER_ARGS,
+      // Use bundled Chromium; on Render set PUPPETEER_EXECUTABLE_PATH env var
+      ...(process.env.PUPPETEER_EXECUTABLE_PATH
+        ? { executablePath: process.env.PUPPETEER_EXECUTABLE_PATH }
+        : {}),
+    },
+    webVersionCache: {
+      type: 'remote',
+      remotePath:
+        'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.3000.1015901740-alpha.html',
     },
   });
 
-  sessions[sessionName] = {
-    client,
-    name: sessionName,
-    status: 'initializing',
-    phone: null,
-    qr: null,
-  };
+  sessionData.client = client;
 
-  // QR event
-  client.on('qr', (qr) => {
-    console.log(`[WA:${sessionName}] QR generated`);
-    qrcode.generate(qr, { small: true });
-    sessions[sessionName].qr = qr;
-    sessions[sessionName].status = 'qr_pending';
-    pendingQRs[sessionName] = qr;
+  // ── QR Code ──────────────────────────────────────────────────────────────────
+  client.on('qr', async (qr) => {
+    console.log(`[WA] QR for "${sessionName}" — scan with WhatsApp`);
+    sessionData.status    = 'qr_pending';
+    sessionData.qrCode    = qr;
+    sessionData.qrDataURL = await qrcode.toDataURL(qr).catch(() => null);
   });
 
-  // Ready event
+  // ── Authenticated ─────────────────────────────────────────────────────────────
+  client.on('authenticated', () => {
+    console.log(`[WA] "${sessionName}" authenticated`);
+    sessionData.status = 'authenticated';
+    sessionData.qrCode = null;
+  });
+
+  // ── Ready ─────────────────────────────────────────────────────────────────────
   client.on('ready', () => {
     const info = client.info;
-    sessions[sessionName].status = 'connected';
-    sessions[sessionName].phone = info?.wid?.user || 'unknown';
-    sessions[sessionName].qr = null;
-    delete pendingQRs[sessionName];
-    console.log(`[WA:${sessionName}] Connected — ${sessions[sessionName].phone}`);
+    sessionData.status = 'connected';
+    sessionData.phone  = info?.wid?.user || 'unknown';
+    sessionData.qrCode = null;
+    console.log(`[WA] "${sessionName}" ready — phone: ${sessionData.phone}`);
   });
 
-  // Auth failure
-  client.on('auth_failure', (msg) => {
-    console.error(`[WA:${sessionName}] Auth failed:`, msg);
-    sessions[sessionName].status = 'auth_failed';
-  });
-
-  // Disconnected — auto reconnect
+  // ── Disconnected — auto-reconnect ─────────────────────────────────────────────
   client.on('disconnected', (reason) => {
-    console.warn(`[WA:${sessionName}] Disconnected: ${reason}`);
-    sessions[sessionName].status = 'disconnected';
+    console.warn(`[WA] "${sessionName}" disconnected: ${reason}`);
+    sessionData.status = 'disconnected';
+    sessionData.qrCode = null;
+
+    // Wait 5 s then try to reconnect
     setTimeout(() => {
-      console.log(`[WA:${sessionName}] Reconnecting...`);
-      client.initialize().catch(console.error);
-    }, config.WHATSAPP.reconnectDelay);
+      console.log(`[WA] Reconnecting "${sessionName}"...`);
+      createSession(sessionName);
+    }, 5000);
   });
 
-  // Incoming message — OTP detection
+  // ── Incoming message — extract OTP ───────────────────────────────────────────
   client.on('message', async (msg) => {
+    // Only process text messages
+    if (!msg.body || msg.fromMe) return;
+
+    const otp = extractOTP(msg.body);
+    if (!otp) return;
+
+    const sender = msg.from.replace('@c.us', '');
+    console.log(`[OTP] "${sessionName}" from ${sender}: ${otp} | "${msg.body}"`);
+
     try {
-      const body = msg.body || '';
-      const otp = extractOTP(body);
-      if (!otp) return;
-
-      const sender = msg.from || 'unknown';
-      console.log(`[WA:${sessionName}] OTP detected: ${otp} from ${sender}`);
-
       await saveOTP({
-        otp_code: otp,
-        message: body,
+        otp_code:      otp,
+        message:       msg.body,
         sender_number: sender,
-        session_name: sessionName,
+        session_name:  sessionName,
       });
-
-      console.log(`[DB] OTP saved: ${otp}`);
     } catch (err) {
-      console.error(`[WA:${sessionName}] Message handler error:`, err);
+      console.error('[OTP] DB save error:', err.message);
     }
   });
 
-  client.initialize().catch((err) => {
-    console.error(`[WA:${sessionName}] Init error:`, err);
-    sessions[sessionName].status = 'error';
+  // ── Auth failure ──────────────────────────────────────────────────────────────
+  client.on('auth_failure', (msg) => {
+    console.error(`[WA] Auth failure for "${sessionName}":`, msg);
+    sessionData.status = 'auth_failed';
   });
 
-  return { success: true, message: 'Session initializing, scan QR shortly' };
+  client.initialize().catch((err) => {
+    console.error(`[WA] Init error for "${sessionName}":`, err.message);
+    sessionData.status = 'error';
+  });
+
+  return sessionData;
 }
 
-function removeSession(sessionName) {
-  const session = sessions[sessionName];
-  if (!session) return { success: false, error: 'Session not found' };
+// ── Remove / destroy a session ─────────────────────────────────────────────────
+async function removeSession(sessionName) {
+  const sessionData = sessions.get(sessionName);
+  if (!sessionData) return false;
 
-  session.client.destroy().catch(() => {});
-  delete sessions[sessionName];
-  delete pendingQRs[sessionName];
-  console.log(`[WA] Session removed: ${sessionName}`);
-  return { success: true };
+  try {
+    await sessionData.client.destroy();
+  } catch (_) {}
+
+  // Remove session files from disk
+  const sessionPath = path.resolve(config.SESSION_DIR, `session-${sessionName}`);
+  if (fs.existsSync(sessionPath)) {
+    fs.rmSync(sessionPath, { recursive: true, force: true });
+  }
+
+  sessions.delete(sessionName);
+  console.log(`[WA] Session "${sessionName}" removed.`);
+  return true;
 }
 
+// ── Get status of all sessions ─────────────────────────────────────────────────
 function getSessionsStatus() {
-  return Object.values(sessions).map((s) => ({
-    name: s.name,
-    status: s.status,
-    phone: s.phone,
-    hasQR: !!s.qr,
-  }));
+  const result = [];
+  for (const [name, data] of sessions.entries()) {
+    result.push({
+      name,
+      status:    data.status,
+      phone:     data.phone,
+      hasQR:     !!data.qrCode,
+      qrDataURL: data.qrDataURL || null,
+    });
+  }
+  return result;
 }
 
-function getQR(sessionName) {
-  return pendingQRs[sessionName] || null;
+// ── Get single session (for QR retrieval) ────────────────────────────────────
+function getSession(sessionName) {
+  return sessions.get(sessionName) || null;
 }
 
-module.exports = { createSession, removeSession, getSessionsStatus, getQR };
+// ── Auto-restore persisted sessions from disk ─────────────────────────────────
+function restorePersistedSessions() {
+  const dir = ensureSessionDir();
+  if (!fs.existsSync(dir)) return;
+
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
+  for (const entry of entries) {
+    if (entry.isDirectory() && entry.name.startsWith('session-')) {
+      const sessionName = entry.name.replace('session-', '');
+      console.log(`[WA] Restoring persisted session: ${sessionName}`);
+      createSession(sessionName);
+    }
+  }
+}
+
+module.exports = {
+  createSession,
+  removeSession,
+  getSessionsStatus,
+  getSession,
+  restorePersistedSessions,
+};
